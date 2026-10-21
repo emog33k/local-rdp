@@ -1,0 +1,7 @@
+# Forks are separate git repositories
+moonlight-qt/
+sunshine/
+# Toolchains and downloads (recreated by scripts/fetch-qt.ps1 etc.)
+tools/
+# Build outputs
+dist/
