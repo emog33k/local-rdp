@@ -18,6 +18,7 @@ param(
     [switch]$DryRun,
     [switch]$Elevated,          # internal: the elevated part
     [string]$UserSid,           # internal: SID of the user who started the install
+    [string]$LogFile,           # internal: where the elevated part writes its output
     [string]$Source = (Join-Path $PSScriptRoot '..\moonlight-qt\build\agent-deploy')
 )
 $ErrorActionPreference = 'Stop'
@@ -53,14 +54,19 @@ if (-not $Elevated) {
     Step "stop a running agent"
     if (-not $DryRun) { Get-Process LocalRdpAgent -ErrorAction SilentlyContinue | Stop-Process -Force }
 
-    $elevArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Elevated',
-              '-UserSid', $me.User.Value, '-Source', "`"$Source`"")
+    # The elevated window closes when done, so it writes what it did to a log file.
+    $elevLog = Join-Path $env:TEMP 'localrdp-agent-install.log'
+    Remove-Item $elevLog -ErrorAction SilentlyContinue
     if ($DryRun) {
-        $elevArgs += '-DryRun'
-        & powershell @args
+        # Same process tree, no UAC: PowerShell quotes the arguments itself here
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -Elevated `
+            -UserSid $me.User.Value -Source $Source -LogFile $elevLog -DryRun
     } else {
+        $elevArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Elevated',
+                      '-UserSid', $me.User.Value, '-Source', "`"$Source`"", '-LogFile', "`"$elevLog`"")
         $p = Start-Process powershell -Verb RunAs -Wait -PassThru -ArgumentList $elevArgs
-        if ($p.ExitCode -ne 0) { throw "The administrator part failed (exit $($p.ExitCode)). See the window output." }
+        if (Test-Path $elevLog) { Get-Content $elevLog }
+        if ($p.ExitCode -ne 0) { throw "The administrator part failed (exit $($p.ExitCode)); see the lines above." }
     }
 
     Do-Or-Show "start the agent at sign-in (HKCU Run)" {
@@ -82,6 +88,12 @@ if (-not $Elevated) {
 }
 
 # ---- Elevated part ----
+if ($LogFile) { Start-Transcript -Path $LogFile -Force | Out-Null }
+trap {
+    Write-Host "ERROR: $_"
+    if ($LogFile) { Stop-Transcript | Out-Null }
+    exit 1
+}
 if (-not $isAdmin -and -not $DryRun) { throw 'The elevated part must run as administrator.' }
 # DPAPI "current user" must be the person who started the install, or the agent
 # (running as that person) could not read the key.
@@ -99,6 +111,7 @@ Do-Or-Show "export Sunshine's certificate and DPAPI-protected key to $DataDir" {
     New-Item -ItemType Directory -Force $DataDir | Out-Null
     # Only this user and SYSTEM may read the folder
     & icacls $DataDir /inheritance:r /grant:r "*$($UserSid):(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $DataDir (icacls exit $LASTEXITCODE)." }
     Copy-Item (Join-Path $SunshineCfg 'credentials\cacert.pem') (Join-Path $DataDir 'server.crt') -Force
     $key = [IO.File]::ReadAllBytes((Join-Path $SunshineCfg 'credentials\cakey.pem'))
     try {
@@ -114,4 +127,5 @@ Do-Or-Show "allow TCP 48100 for the agent from the local subnet" {
     New-NetFirewallRule -DisplayName $RuleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort 48100 `
         -Profile Any -RemoteAddress LocalSubnet -Program $Exe | Out-Null
 }
+if ($LogFile) { Stop-Transcript | Out-Null }
 exit 0
