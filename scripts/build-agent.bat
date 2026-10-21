@@ -11,7 +11,10 @@ where /q jom.exe && set JOM=jom
 
 set "OUT=L:\moonlight-qt\build\agent"
 set "DEPLOY=L:\moonlight-qt\build\agent-deploy"
-if not exist "%OUT%" mkdir "%OUT%"
+rem Always a clean build: it is small, and a stale object file with an older class
+rem layout once made the agent crash at random.
+if exist "%OUT%" rmdir /s /q "%OUT%"
+mkdir "%OUT%"
 pushd "%OUT%"
 qmake L:\moonlight-qt\localrdp\agent\localrdp-agent.pro || (popd & exit /b 1)
 %JOM% release || (popd & exit /b 1)
