@@ -64,14 +64,19 @@ if (-not $Elevated) {
     $elevLog = Join-Path $env:TEMP ("localrdp-rotate-" + [guid]::NewGuid().ToString('N') + ".log")
     $elevArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Elevated',
                   '-UserSid', $me.User.Value, '-LogFile', "`"$elevLog`"")
-    $p = Start-Process $PowerShell -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList $elevArgs
-    if (Test-Path $elevLog) { Get-Content $elevLog; Remove-Item $elevLog -ErrorAction SilentlyContinue }
-    if ($p.ExitCode -ne 0) { throw "The administrator part failed (exit $($p.ExitCode)); see the lines above." }
-
-    if (Test-Path $AgentExe) {
-        Step "restart LocalRDP Agent (it loads its new certificate)"
-        Stop-OurAgent
-        Start-Process -FilePath $AgentExe -WorkingDirectory $AgentDir
+    try {
+        $p = Start-Process $PowerShell -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList $elevArgs
+        if (Test-Path $elevLog) { Get-Content $elevLog; Remove-Item $elevLog -ErrorAction SilentlyContinue }
+        if ($p.ExitCode -ne 0) { throw "The administrator part failed (exit $($p.ExitCode)); see the lines above." }
+    }
+    finally {
+        # The elevated part stops the agent to replace its certificate: whatever
+        # happened, start it again (with the new certificate if it was made)
+        if (Test-Path $AgentExe) {
+            Step "restart LocalRDP Agent (it loads its new certificate)"
+            Stop-OurAgent
+            Start-Process -FilePath $AgentExe -WorkingDirectory $AgentDir
+        }
     }
     Write-Host "Done. Pair the laptop again: Moonlight > the PC > PIN in https://localhost:47990" -ForegroundColor Green
     exit 0
@@ -160,6 +165,8 @@ Remove-Item -LiteralPath ($Key + $Suffix), ($Cert + $Suffix), ($StateFile + $Suf
 
 if (Test-Path $AgentExe) {
     Step "give LocalRDP Agent a new certificate (signed with the new key)"
+    # A running agent keeps its files open, so they could not be replaced
+    Stop-OurAgent
     $out = Join-Path $AgentData 'issue.txt'
     $p = Start-Process -FilePath $AgentExe -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out `
         -ArgumentList @('--issue-identity', '--credentials', "`"$CredDir`"", '--out', "`"$AgentData`"")
