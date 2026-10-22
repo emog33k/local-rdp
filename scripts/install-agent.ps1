@@ -2,11 +2,12 @@
 Installs (or updates) LocalRDP Agent on this PC.
 
 What it does:
-  1. Copies the agent to "C:\Program Files\LocalRDP Agent".
-  2. Exports Sunshine's certificate and private key for the agent. The key is
-     encrypted with DPAPI for the current Windows user and stored in
-     "%ProgramData%\LocalRDP Agent" (folder readable only by that user and SYSTEM).
-     Moonlight already trusts exactly this certificate from pairing with Sunshine.
+  1. Copies the agent to "C:\Program Files\LocalRDP Agent" (stopping a running
+     agent of this user first).
+  2. Gives the agent its own certificate, signed with Sunshine's key (Moonlight
+     trusts what Sunshine signs), and a key of its own, encrypted with DPAPI for
+     the current Windows user, in "%ProgramData%\LocalRDP Agent" (readable only by
+     that user and SYSTEM). Sunshine's own key stays where it is.
   3. Allows TCP 48100 in the firewall from the local subnet only (any network
      profile: Windows often marks a home network as Public), for the agent only.
   4. Starts the agent at sign-in (HKCU Run) and starts it now (not elevated).
@@ -30,11 +31,34 @@ $SunshineCfg = Join-Path $env:ProgramFiles 'Sunshine\config'
 $RuleName    = 'LocalRDP Agent (TCP 48100, local subnet)'
 $RunKey      = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $RunValue    = 'LocalRDP Agent'
+# Never a "powershell" found through PATH
+$PowerShell  = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
 function Step($text) { Write-Host "  - $text" }
 function Do-Or-Show([string]$text, [scriptblock]$action) {
     Step $text
     if (-not $DryRun) { & $action }
+}
+
+# Agents of this Windows session only (another user's agent is none of our business)
+function Stop-OurAgent {
+    $session = (Get-Process -Id $PID).SessionId
+    $agents = @(Get-Process LocalRdpAgent -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session })
+    foreach ($a in $agents) {
+        Stop-Process -Id $a.Id -Force -ErrorAction SilentlyContinue
+        Wait-Process -Id $a.Id -Timeout 10 -ErrorAction SilentlyContinue
+    }
+}
+
+# True once our agent (this exe) listens on TCP 48100, waiting up to 10 s
+function Wait-AgentListening {
+    for ($i = 0; $i -lt 20; $i++) {
+        $owners = @(Get-NetTCPConnection -LocalPort 48100 -State Listen -ErrorAction SilentlyContinue |
+                    ForEach-Object { Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue })
+        if ($owners | Where-Object { $_.Path -and ($_.Path -ieq $Exe) }) { return $true }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
 }
 
 $me = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -51,40 +75,51 @@ if (-not $Elevated) {
     }
 
     Write-Host "LocalRDP Agent install$(if ($DryRun) {' (dry run: nothing is changed)'})"
-    Step "stop a running agent"
-    if (-not $DryRun) { Get-Process LocalRdpAgent -ErrorAction SilentlyContinue | Stop-Process -Force }
-
-    # The elevated window closes when done, so it writes what it did to a log file.
-    $elevLog = Join-Path $env:TEMP 'localrdp-agent-install.log'
-    Remove-Item $elevLog -ErrorAction SilentlyContinue
     if ($DryRun) {
-        # Same process tree, no UAC: PowerShell quotes the arguments itself here
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -Elevated `
-            -UserSid $me.User.Value -Source $Source -LogFile $elevLog -DryRun
-    } else {
+        # Same process tree, no UAC, no log file
+        & $PowerShell -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -Elevated `
+            -UserSid $me.User.Value -Source $Source -DryRun
+        if ($LASTEXITCODE -ne 0) { throw "The administrator part failed (exit $LASTEXITCODE)." }
+        Step "start the agent at sign-in (HKCU Run)"
+        Step "start the agent now and check that it listens on TCP 48100"
+        exit 0
+    }
+
+    # The elevated window closes when done, so it writes what it did to a log file
+    $elevLog = Join-Path $env:TEMP ("localrdp-agent-install-" + [guid]::NewGuid().ToString('N') + ".log")
+    $ok = $false
+    try {
         $elevArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Elevated',
                       '-UserSid', $me.User.Value, '-Source', "`"$Source`"", '-LogFile', "`"$elevLog`"")
-        $p = Start-Process powershell -Verb RunAs -Wait -PassThru -ArgumentList $elevArgs
-        if (Test-Path $elevLog) { Get-Content $elevLog }
+        $p = Start-Process $PowerShell -Verb RunAs -Wait -PassThru -ArgumentList $elevArgs
+        if (Test-Path $elevLog) { Get-Content $elevLog; Remove-Item $elevLog -ErrorAction SilentlyContinue }
         if ($p.ExitCode -ne 0) { throw "The administrator part failed (exit $($p.ExitCode)); see the lines above." }
-    }
 
-    Do-Or-Show "start the agent at sign-in (HKCU Run)" {
+        Step "start the agent at sign-in (HKCU Run)"
         Set-ItemProperty -Path $RunKey -Name $RunValue -Value "`"$Exe`""
+        $ok = $true
     }
-    Do-Or-Show "start the agent now" {
-        Start-Process -FilePath $Exe -WorkingDirectory $InstallDir
-        Start-Sleep -Seconds 2
-        $listening = Get-NetTCPConnection -LocalPort 48100 -State Listen -ErrorAction SilentlyContinue
-        $log = Join-Path $env:LOCALAPPDATA 'LocalRDP Agent\agent.log'
-        if ($listening) {
-            Write-Host "LocalRDP Agent is running and listening on TCP 48100." -ForegroundColor Green
-        } else {
-            Write-Warning "The agent is not listening. Last log lines:"
-            if (Test-Path $log) { Get-Content $log -Tail 10 }
+    finally {
+        # Whatever happened above (UAC cancelled, a step failed): never leave the
+        # PC without a running agent if one is installed
+        if (Test-Path $Exe) {
+            $session = (Get-Process -Id $PID).SessionId
+            $running = @(Get-Process LocalRdpAgent -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session })
+            if ($running.Count -eq 0) {
+                Step "start the agent now"
+                Start-Process -FilePath $Exe -WorkingDirectory $InstallDir
+            }
         }
     }
-    exit 0
+
+    $log = Join-Path $env:LOCALAPPDATA 'LocalRDP Agent\agent.log'
+    if ($ok -and (Wait-AgentListening)) {
+        Write-Host "LocalRDP Agent is running and listening on TCP 48100." -ForegroundColor Green
+        exit 0
+    }
+    Write-Warning "The agent is not listening. Last log lines:"
+    if (Test-Path $log) { Get-Content $log -Tail 10 }
+    exit 1
 }
 
 # ---- Elevated part ----
@@ -96,30 +131,33 @@ trap {
 }
 if (-not $isAdmin -and -not $DryRun) { throw 'The elevated part must run as administrator.' }
 # DPAPI "current user" must be the person who started the install, or the agent
-# (running as that person) could not read the key.
+# (running as that person) could not read its key.
 if ($me.User.Value -ne $UserSid) {
     throw "Administrator rights were given by a different Windows account. Sign in as an administrator user and run the install again."
 }
 
-Do-Or-Show "copy the agent to $InstallDir" {
+Do-Or-Show "stop the running agent and copy the new one to $InstallDir" {
+    Stop-OurAgent
     New-Item -ItemType Directory -Force $InstallDir | Out-Null
     Copy-Item -Path (Join-Path $Source '*') -Destination $InstallDir -Recurse -Force
 }
 
-Do-Or-Show "export Sunshine's certificate and DPAPI-protected key to $DataDir" {
-    Add-Type -AssemblyName System.Security
+Do-Or-Show "make the agent's own certificate (signed with Sunshine's key) in $DataDir" {
+    # A fresh folder owned by Administrators, readable only by this user and SYSTEM
+    # (a folder someone else created beforehand would keep its owner and rights)
+    if (Test-Path $DataDir) { Remove-Item -Recurse -Force $DataDir }
     New-Item -ItemType Directory -Force $DataDir | Out-Null
-    # Only this user and SYSTEM may read the folder
+    & icacls $DataDir /setowner '*S-1-5-32-544' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not set the owner of $DataDir (icacls exit $LASTEXITCODE)." }
     & icacls $DataDir /inheritance:r /grant:r "*$($UserSid):(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $DataDir (icacls exit $LASTEXITCODE)." }
-    Copy-Item (Join-Path $SunshineCfg 'credentials\cacert.pem') (Join-Path $DataDir 'server.crt') -Force
-    $key = [IO.File]::ReadAllBytes((Join-Path $SunshineCfg 'credentials\cakey.pem'))
-    try {
-        $blob = [Security.Cryptography.ProtectedData]::Protect($key, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)
-        [IO.File]::WriteAllBytes((Join-Path $DataDir 'server.key.dpapi'), $blob)
-    } finally {
-        [Array]::Clear($key, 0, $key.Length)
-    }
+
+    # The agent itself does it (it reads Sunshine's key only now, as administrator)
+    $out = Join-Path $DataDir 'issue.txt'
+    $p = Start-Process -FilePath $Exe -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out `
+        -ArgumentList @('--issue-identity', '--credentials', "`"$(Join-Path $SunshineCfg 'credentials')`"", '--out', "`"$DataDir`"")
+    if (Test-Path $out) { Get-Content $out; Remove-Item $out -Force }
+    if ($p.ExitCode -ne 0) { throw "Could not make the agent certificate (exit $($p.ExitCode))." }
 }
 
 Do-Or-Show "allow TCP 48100 for the agent from the local subnet" {
