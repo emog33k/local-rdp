@@ -143,14 +143,25 @@ Do-Or-Show "stop the running agent and copy the new one to $InstallDir" {
 }
 
 Do-Or-Show "make the agent's own certificate (signed with Sunshine's key) in $DataDir" {
-    # A fresh folder owned by Administrators, readable only by this user and SYSTEM
-    # (a folder someone else created beforehand would keep its owner and rights)
-    if (Test-Path $DataDir) { Remove-Item -Recurse -Force $DataDir }
-    New-Item -ItemType Directory -Force $DataDir | Out-Null
-    & icacls $DataDir /setowner '*S-1-5-32-544' | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Could not set the owner of $DataDir (icacls exit $LASTEXITCODE)." }
-    & icacls $DataDir /inheritance:r /grant:r "*$($UserSid):(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $DataDir (icacls exit $LASTEXITCODE)." }
+    # Never follow a link someone planted there (rights and files would land elsewhere)
+    if (-not (Test-Path -LiteralPath $DataDir)) { New-Item -ItemType Directory $DataDir | Out-Null }
+    $item = Get-Item -LiteralPath $DataDir -Force
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "$DataDir is not a normal folder (a link?). Remove it and run the install again."
+    }
+    # Replace all access rules: owner Administrators, only this user and SYSTEM, nothing
+    # inherited and nothing left over from whoever may have created the folder before.
+    # The folder is kept, so the current certificate stays usable if a step below fails.
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'))
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @($UserSid, 'S-1-5-18')) {
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            (New-Object System.Security.Principal.SecurityIdentifier $sid), 'FullControl',
+            'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        $acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $DataDir -AclObject $acl
 
     # The agent itself does it (it reads Sunshine's key only now, as administrator)
     $out = Join-Path $DataDir 'issue.txt'
