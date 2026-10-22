@@ -34,7 +34,7 @@ if (-not $Elevated) {
         if ($LASTEXITCODE -ne 0) { throw "The administrator part failed (exit $LASTEXITCODE)." }
     }
     else {
-        $p = Start-Process $PowerShell -Verb RunAs -Wait -PassThru -ArgumentList $elevArgs
+        $p = Start-Process $PowerShell -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList $elevArgs
         if ($p.ExitCode -ne 0) { throw "The administrator part failed (exit $($p.ExitCode))." }
         Write-Host "LocalRDP Agent removed." -ForegroundColor Green
     }

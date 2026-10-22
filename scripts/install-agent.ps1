@@ -91,7 +91,7 @@ if (-not $Elevated) {
     try {
         $elevArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Elevated',
                       '-UserSid', $me.User.Value, '-Source', "`"$Source`"", '-LogFile', "`"$elevLog`"")
-        $p = Start-Process $PowerShell -Verb RunAs -Wait -PassThru -ArgumentList $elevArgs
+        $p = Start-Process $PowerShell -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList $elevArgs
         if (Test-Path $elevLog) { Get-Content $elevLog; Remove-Item $elevLog -ErrorAction SilentlyContinue }
         if ($p.ExitCode -ne 0) { throw "The administrator part failed (exit $($p.ExitCode)); see the lines above." }
 
